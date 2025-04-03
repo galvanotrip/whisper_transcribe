@@ -115,9 +115,19 @@ def process_folder(folder_path):
         transcribe_file(input_path, output_path)
 
 if __name__ == "__main__":
+    print("=== START ===")
+
     parser = argparse.ArgumentParser(description="Transcribe audio/video files in a folder.")
     parser.add_argument("folder", nargs="?", default="/Volumes/Transcend/video", help="Path to the folder with files")
     args = parser.parse_args()
 
     folder = args.folder
-    process_folder(folder)
+
+    try:
+        process_folder(folder)
+        print("=== DONE ===")
+        sys.exit(0)
+    except Exception as e:
+        log(f"❌ Script failed with error: {e}")
+        print("=== FAILED ===")
+        sys.exit(1)
