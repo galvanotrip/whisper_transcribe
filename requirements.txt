@@ -1,0 +1,6 @@
+# openai-whisper 
+ffmpeg-python
+faster-whisper
+
+
+# + needs to install: "brew install pkg-config"
