@@ -1,6 +1,6 @@
 # openai-whisper 
 ffmpeg-python
 faster-whisper
-
+huggingface_hub[hf_xet]
 
 # + needs to install: "brew install pkg-config"
