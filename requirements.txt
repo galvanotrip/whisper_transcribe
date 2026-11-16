@@ -2,5 +2,6 @@
 ffmpeg-python
 faster-whisper
 huggingface_hub[hf_xet]
+av<19
 
 # + needs to install: "brew install pkg-config"
