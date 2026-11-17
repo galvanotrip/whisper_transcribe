@@ -4,7 +4,7 @@ Flow:
   1. Find files that still need work (no .txt yet, or a .txt with a .checkpoint).
   2. Detect each file's language with a small Whisper model on 3 samples
      taken from different parts of the file. Results are cached in
-     <folder>/.lang_cache.json after every file, so a crash does not repeat detection.
+     <folder>/.lang_cache.json (keys: path relative to <folder>) after every file, so a crash does not repeat detection.
   3. Group files by engine and load ONE engine at a time (8 GB RAM budget):
        he                      -> ivrit-ai/whisper-large-v3-turbo-ct2 (faster-whisper)
        25 European languages   -> NVIDIA Parakeet TDT 0.6B v3 int8 (onnx-asr)
@@ -23,6 +23,7 @@ import argparse
 import gc
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -30,6 +31,7 @@ import time
 
 import numpy as np
 
+YTDLP_STREAM = re.compile(r"\.f\d+\.\w+$")  # e.g. "title.f401.mp4"
 SUPPORTED_EXT = ('.mp4', '.mp3', '.wav', '.mkv')
 LOG_FILE = "log.txt"
 LANG_CACHE_NAME = ".lang_cache.json"  # stored inside the media folder, next to the files
@@ -129,7 +131,7 @@ def load_lang_cache(path):
             with open(LEGACY_LANG_CACHE, encoding="utf-8") as f:
                 old = json.load(f)
             log(f"🌐 Импорт {len(old)} языков из {LEGACY_LANG_CACHE}")
-            return {os.path.basename(k): v for k, v in old.items()}
+            return {os.path.basename(k): v for k, v in old.items()}  # old run covered only the root folder
         return {}
     try:
         with open(path, encoding="utf-8") as f:
@@ -248,15 +250,20 @@ def transcribe_file(engine, path, lang, output_file):
 
 
 def pending_files(folder):
+    """All media files in folder and its subfolders (<channel>/<playlist>/...) without a finished .txt."""
     result = []
-    for name in sorted(os.listdir(folder)):
-        path = os.path.join(folder, name)
-        if not (name.lower().endswith(SUPPORTED_EXT) and os.path.isfile(path)):
-            continue
-        out = os.path.splitext(path)[0] + ".txt"
-        if os.path.exists(out) and not os.path.exists(out + ".checkpoint"):
-            continue
-        result.append((path, out))
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for name in sorted(files):
+            path = os.path.join(root, name)
+            if name.startswith(".") or not name.lower().endswith(SUPPORTED_EXT):
+                continue
+            if YTDLP_STREAM.search(name):  # intermediate stream of an unfinished download
+                continue
+            out = os.path.splitext(path)[0] + ".txt"
+            if os.path.exists(out) and not os.path.exists(out + ".checkpoint"):
+                continue
+            result.append((path, out))
     return result
 
 
@@ -269,7 +276,8 @@ def process_folder(folder):
     # 1. Language detection with a small model, cached between runs.
     cache_path = os.path.join(folder, LANG_CACHE_NAME)
     cache = load_lang_cache(cache_path)
-    key = os.path.basename
+    def key(p):  # path relative to the media folder; for files in its root this is the bare name
+        return os.path.relpath(p, folder)
     need = [(p, o) for p, o in todo if key(p) not in cache]
     log(f"🌐 Язык уже известен: {len(todo) - len(need)}, определить: {len(need)}")
     if need:
@@ -281,7 +289,7 @@ def process_folder(folder):
                 lang, prob = detect_language(detector, path, get_duration(path))
                 cache[key(path)] = {"lang": lang, "prob": round(prob, 3)}
                 save_lang_cache(cache_path, cache)
-                log(f"🌐 {os.path.basename(path)}: {lang} ({prob:.2f})")
+                log(f"🌐 {key(path)}: {lang} ({prob:.2f})")
             except Exception as e:
                 log(f"❌ Не удалось определить язык {path}: {e}")
         del detector
@@ -302,7 +310,7 @@ def process_folder(folder):
         engine = make_engine(kind)
         log(f"🧠 Модель: {engine.name}")
         for path, out, lang in files:
-            log(f"🟡 Обработка [{lang}]: {os.path.basename(path)}")
+            log(f"🟡 Обработка [{lang}]: {os.path.relpath(path, folder)}")
             try:
                 transcribe_file(engine, path, lang, out)
             except Exception as e:
