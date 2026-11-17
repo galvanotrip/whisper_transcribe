@@ -28,7 +28,7 @@ pipeline {
                 sh '''
                     echo "▶️ Running script with URL: $URL"
                     . venv/bin/activate
-                    python -u main.py /var/smb/
+                    nice -n 10 python -u main.py /var/smb/
                 '''
             }
         }

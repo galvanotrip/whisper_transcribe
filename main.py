@@ -3,7 +3,8 @@
 Flow:
   1. Find files that still need work (no .txt yet, or a .txt with a .checkpoint).
   2. Detect each file's language with a small Whisper model on 3 samples
-     taken from different parts of the file. Results are cached in lang_cache.json.
+     taken from different parts of the file. Results are cached in
+     <folder>/.lang_cache.json after every file, so a crash does not repeat detection.
   3. Group files by engine and load ONE engine at a time (8 GB RAM budget):
        he                      -> ivrit-ai/whisper-large-v3-turbo-ct2 (faster-whisper)
        25 European languages   -> NVIDIA Parakeet TDT 0.6B v3 int8 (onnx-asr)
@@ -12,8 +13,10 @@ Flow:
      and the processed position is saved to <name>.txt.checkpoint, so a stopped
      run resumes where it left off.
 
-Checkpoint format: "s=<seconds processed>". Old checkpoints written by the
-previous version contain a bare chunk index (60-second chunks) and are converted.
+Checkpoint format: "s=<seconds processed> b=<size of .txt in bytes>". On resume the
+.txt is cut back to b, so a crash between writing text and saving the checkpoint
+never duplicates a chunk. Older formats ("s=<seconds>" or a bare 60-second chunk
+index) are still understood.
 """
 
 import argparse
@@ -29,8 +32,9 @@ import numpy as np
 
 SUPPORTED_EXT = ('.mp4', '.mp3', '.wav', '.mkv')
 LOG_FILE = "log.txt"
-LANG_CACHE_FILE = "lang_cache.json"
+LANG_CACHE_NAME = ".lang_cache.json"  # stored inside the media folder, next to the files
 SAMPLE_RATE = 16000
+CPU_THREADS = int(os.environ.get("CPU_THREADS", "4"))  # i5-4278U: 2 cores / 4 threads
 LEGACY_CHUNK_SECONDS = 60  # chunk size used by the previous version of this script
 
 DETECT_MODEL = os.environ.get("DETECT_MODEL", "base")
@@ -90,34 +94,59 @@ def load_segment(path, start, length):
 # ---------- checkpoint ----------
 
 def read_checkpoint(path):
-    """Return seconds already processed (0 if none). Understands the legacy format."""
+    """Return (seconds processed, txt size in bytes or None). Understands old formats."""
     if not os.path.exists(path):
-        return 0.0
+        return 0.0, None
     raw = open(path).read().strip()
-    if raw.startswith("s="):
-        return float(raw[2:])
     if raw.isdigit():  # legacy: number of finished 60-second chunks
-        return float(int(raw) * LEGACY_CHUNK_SECONDS)
-    raise ValueError(f"unknown checkpoint format in {path}: {raw!r}")
+        return float(int(raw) * LEGACY_CHUNK_SECONDS), None
+    fields = dict(part.split("=", 1) for part in raw.split())
+    if "s" not in fields:
+        raise ValueError(f"unknown checkpoint format in {path}: {raw!r}")
+    size = int(fields["b"]) if "b" in fields else None
+    return float(fields["s"]), size
 
 
-def write_checkpoint(path, seconds):
-    with open(path, "w") as f:
-        f.write(f"s={seconds:.0f}")
+def write_checkpoint(path, seconds, txt_size):
+    """Write atomically: a crash mid-write leaves the previous checkpoint intact."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(f"s={seconds:.0f} b={txt_size}")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 # ---------- language detection ----------
 
-def load_lang_cache():
-    if os.path.exists(LANG_CACHE_FILE):
-        with open(LANG_CACHE_FILE, encoding="utf-8") as f:
+LEGACY_LANG_CACHE = "lang_cache.json"  # previous location: script working dir, full-path keys
+
+
+def load_lang_cache(path):
+    """Cache of detected languages, keyed by file name. Survives crashes and restarts."""
+    if not os.path.exists(path):
+        if os.path.exists(LEGACY_LANG_CACHE):  # one-time import from the previous version
+            with open(LEGACY_LANG_CACHE, encoding="utf-8") as f:
+                old = json.load(f)
+            log(f"🌐 Импорт {len(old)} языков из {LEGACY_LANG_CACHE}")
+            return {os.path.basename(k): v for k, v in old.items()}
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
-    return {}
+    except (OSError, ValueError) as e:
+        log(f"⚠️ Кеш языков повреждён ({e}), определяю заново")
+        return {}
 
 
-def save_lang_cache(cache):
-    with open(LANG_CACHE_FILE, "w", encoding="utf-8") as f:
+def save_lang_cache(path, cache):
+    """Atomic write after every file: a crash loses at most the file in progress."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cache, f, ensure_ascii=False, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def detect_language(model, path, duration):
@@ -154,7 +183,8 @@ class WhisperEngine:
     def __init__(self, model_name):
         from faster_whisper import WhisperModel
         self.name = model_name
-        self.model = WhisperModel(model_name, device="cpu", compute_type="int8")
+        self.model = WhisperModel(model_name, device="cpu", compute_type="int8",
+                                  cpu_threads=CPU_THREADS)
         self.chunk_seconds = WHISPER_CHUNK_SECONDS
 
     def transcribe(self, audio, lang):
@@ -165,8 +195,11 @@ class WhisperEngine:
 class ParakeetEngine:
     def __init__(self):
         import onnx_asr
+        import onnxruntime
+        opts = onnxruntime.SessionOptions()
+        opts.intra_op_num_threads = CPU_THREADS
         self.name = PARAKEET_MODEL
-        self.model = onnx_asr.load_model(PARAKEET_MODEL, quantization="int8")
+        self.model = onnx_asr.load_model(PARAKEET_MODEL, quantization="int8", sess_options=opts)
         self.chunk_seconds = PARAKEET_CHUNK_SECONDS
 
     def transcribe(self, audio, lang):
@@ -186,7 +219,11 @@ def make_engine(kind):
 def transcribe_file(engine, path, lang, output_file):
     checkpoint_path = output_file + ".checkpoint"
     duration = get_duration(path)
-    pos = read_checkpoint(checkpoint_path)
+    pos, txt_size = read_checkpoint(checkpoint_path)
+    if txt_size is not None and os.path.exists(output_file) and os.path.getsize(output_file) > txt_size:
+        # text of an unfinished chunk was written but its checkpoint was not: drop it
+        with open(output_file, "r+b") as f:
+            f.truncate(txt_size)
     if pos > 0:
         log(f"  ⏩ Продолжаю с {pos/60:.1f} мин")
     started = time.time()
@@ -198,8 +235,10 @@ def transcribe_file(engine, path, lang, output_file):
         with open(output_file, "a", encoding="utf-8") as f:
             if text:
                 f.write(text + "\n")
+            f.flush()
+            os.fsync(f.fileno())
         pos += length
-        write_checkpoint(checkpoint_path, pos)
+        write_checkpoint(checkpoint_path, pos, os.path.getsize(output_file))
         elapsed = (time.time() - started) / 60
         log(f"  ⏳ {pos/duration*100:5.1f}%  {pos/60:.1f}/{duration/60:.1f} мин аудио, прошло {elapsed:.1f} мин")
         gc.collect()
@@ -228,16 +267,20 @@ def process_folder(folder):
         return 0
 
     # 1. Language detection with a small model, cached between runs.
-    cache = load_lang_cache()
-    need = [(p, o) for p, o in todo if p not in cache]
+    cache_path = os.path.join(folder, LANG_CACHE_NAME)
+    cache = load_lang_cache(cache_path)
+    key = os.path.basename
+    need = [(p, o) for p, o in todo if key(p) not in cache]
+    log(f"🌐 Язык уже известен: {len(todo) - len(need)}, определить: {len(need)}")
     if need:
         from faster_whisper import WhisperModel
-        detector = WhisperModel(DETECT_MODEL, device="cpu", compute_type="int8")
+        detector = WhisperModel(DETECT_MODEL, device="cpu", compute_type="int8",
+                                cpu_threads=CPU_THREADS)
         for path, _ in need:
             try:
                 lang, prob = detect_language(detector, path, get_duration(path))
-                cache[path] = {"lang": lang, "prob": round(prob, 3)}
-                save_lang_cache(cache)
+                cache[key(path)] = {"lang": lang, "prob": round(prob, 3)}
+                save_lang_cache(cache_path, cache)
                 log(f"🌐 {os.path.basename(path)}: {lang} ({prob:.2f})")
             except Exception as e:
                 log(f"❌ Не удалось определить язык {path}: {e}")
@@ -247,8 +290,9 @@ def process_folder(folder):
     # 2. Group by engine so only one model sits in memory at a time.
     groups = {"hebrew": [], "parakeet": [], "fallback": []}
     for path, out in todo:
-        if path in cache:
-            groups[route(cache[path]["lang"])].append((path, out, cache[path]["lang"]))
+        if key(path) in cache:
+            lang = cache[key(path)]["lang"]
+            groups[route(lang)].append((path, out, lang))
     log("📦 " + ", ".join(f"{k}: {len(v)}" for k, v in groups.items()))
 
     failed = len(todo) - sum(len(v) for v in groups.values())
