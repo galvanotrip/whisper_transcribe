@@ -1,6 +1,11 @@
 pipeline {
     agent any
 
+    environment {
+        // persistent model cache: survives container re-creation
+        HF_HOME = '/var/jenkins_home/hf-cache'
+    }
+
     // parameters {
     //     string(name: 'URL', defaultValue: '', description: 'Enter the video URL to process')
     // }

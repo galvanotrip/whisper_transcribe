@@ -3,5 +3,7 @@ ffmpeg-python
 faster-whisper
 huggingface_hub[hf_xet]
 av<19
+numpy
+onnx-asr[cpu,hub]
 
 # + needs to install: "brew install pkg-config"
